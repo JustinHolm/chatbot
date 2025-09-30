@@ -1,2 +1,4 @@
-streamlit
+chromadb
 openai
+streamlit
+tqdm
