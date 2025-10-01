@@ -1,6 +1,17 @@
+import tiktoken
 import streamlit as st
 import os
 from openai import OpenAI
+import time
+
+# Fix sqlite3 version issue for ChromaDB
+import sys
+try:
+    __import__('pysqlite3')
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass
+
 import chromadb
 from chromadb.config import Settings
 from tqdm import tqdm
@@ -9,17 +20,23 @@ import glob
 from chromadb.utils import embedding_functions
 
 # Title and instructions
-st.title("💬 Chatbot with RAG")
+st.title("💬 Dragedal Family History Chatbot")
 st.write(
-    "This chatbot uses OpenAI's GPT-3.5 model and retrieves context from two uploaded documents. "
-    "To use it, enter your OpenAI API key below. Make sure your documents are in the `docs/` folder."
+    "This chatbot helps you research families, people, and events in Dragedal using historical documents. "
+    "To use it, enter your OpenAI API key below."
 )
 
 
 # API key from Streamlit secrets or input
-if "API_KEY" in st.secrets:
-    openai_api_key = st.secrets["API_KEY"]
-else:
+try:
+    if "API_KEY" in st.secrets:
+        openai_api_key = st.secrets["API_KEY"]
+    else:
+        openai_api_key = st.text_input("OpenAI API Key", type="password")
+        if not openai_api_key:
+            st.info("Please add your OpenAI API key to continue.", icon="🗝️")
+            st.stop()
+except:
     openai_api_key = st.text_input("OpenAI API Key", type="password")
     if not openai_api_key:
         st.info("Please add your OpenAI API key to continue.", icon="🗝️")
@@ -32,6 +49,8 @@ client = OpenAI(api_key=openai_api_key)
 # Load and embed documents into ChromaDB
 @st.cache_resource
 def load_vectorstore(api_key):
+    # Use tiktoken to count tokens for OpenAI embedding model
+    encoding = tiktoken.encoding_for_model("text-embedding-ada-002")
     # Set up ChromaDB in-memory client
     client = chromadb.Client(Settings(anonymized_telemetry=False))
     # Use OpenAI embedding function
@@ -39,7 +58,9 @@ def load_vectorstore(api_key):
         api_key=api_key,
         model_name="text-embedding-ada-002"
     )
-    collection = client.create_collection(name="docs", embedding_function=openai_ef)
+    import uuid
+    collection_name = f"docs_{uuid.uuid4().hex[:8]}"
+    collection = client.create_collection(name=collection_name, embedding_function=openai_ef)
 
     # Load all .txt files from docs/
     filepaths = glob.glob("docs/*.txt")
@@ -47,25 +68,66 @@ def load_vectorstore(api_key):
         st.warning("No text files found in docs/ folder.")
         return None
 
-    # Read and chunk documents
-    chunk_size = 500
-    chunk_overlap = 50
-    doc_texts = []
-    metadatas = []
-    ids = []
+    # Read and chunk documents with smaller chunks for Streamlit Cloud
+    chunk_size = 500  # Much smaller for Streamlit Cloud
+    chunk_overlap = 100
+    all_docs, all_metas, all_ids = [], [], []
     idx = 0
-    for filepath in filepaths:
-        with open(filepath, "r", encoding="utf-8") as f:
-            text = f.read()
-            # Chunk text
-            for i in range(0, len(text), chunk_size - chunk_overlap):
-                chunk = text[i:i+chunk_size]
-                doc_texts.append(chunk)
-                metadatas.append({"source": os.path.basename(filepath)})
-                ids.append(f"{os.path.basename(filepath)}_{idx}")
-                idx += 1
-    # Add to Chroma collection
-    collection.add(documents=doc_texts, metadatas=metadatas, ids=ids)
+    
+    with st.spinner("Loading historical documents..."):
+        for filepath in filepaths:
+            with open(filepath, "r", encoding="utf-8") as f:
+                text = f.read()
+                filename = os.path.basename(filepath)
+                
+                # Split into chunks
+                for i in range(0, len(text), chunk_size - chunk_overlap):
+                    chunk = text[i:i+chunk_size]
+                    if len(chunk.strip()) > 50:  # Skip very short chunks
+                        all_docs.append(chunk)
+                        all_metas.append({"source": filename})
+                        all_ids.append(f"{filename}_{idx}")
+                        idx += 1
+        
+        # Add documents to ChromaDB with very conservative batching for Streamlit Cloud
+        if all_docs:
+            total_chunks = len(all_docs)
+            progress_bar = st.progress(0)
+            processed = 0
+            
+            # Process documents one by one for maximum reliability on Streamlit Cloud
+            for i, (doc, meta, doc_id) in enumerate(zip(all_docs, all_metas, all_ids)):
+                # Check token count for this single document
+                doc_tokens = len(encoding.encode(doc))
+                
+                # Skip documents that are too large
+                if doc_tokens > 8000:  # Very conservative limit
+                    st.warning(f"Skipping large document chunk ({doc_tokens} tokens)")
+                    processed += 1
+                    progress_bar.progress(processed / total_chunks)
+                    continue
+                
+                try:
+                    collection.add(documents=[doc], metadatas=[meta], ids=[doc_id])
+                    processed += 1
+                    
+                    # Update progress every 10 documents
+                    if processed % 10 == 0:
+                        progress_bar.progress(processed / total_chunks)
+                    
+                    # Add small delay to avoid overwhelming Streamlit Cloud
+                    if processed % 20 == 0:
+                        time.sleep(0.1)
+                        
+                except Exception as e:
+                    st.warning(f"Skipped document chunk due to error: {str(e)[:100]}...")
+                    processed += 1
+                    continue
+            
+            progress_bar.progress(1.0)
+            progress_bar.empty()
+            st.success(f"✅ Successfully loaded {processed} text segments from {len(filepaths)} historical documents.")
+    
     return collection
 
 
@@ -87,7 +149,7 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # Chat input
-if prompt := st.chat_input("Ask me anything…"):
+if prompt := st.chat_input("Ask about families, people, or events in Dragedal..."):
     # Store user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -104,8 +166,10 @@ if prompt := st.chat_input("Ask me anything…"):
         {
             "role": "system",
             "content": (
-                "You are a helpful assistant. Answer ONLY using the information provided in the CONTEXT below. "
-                "If the answer is not in the context, reply with 'I don't know based on the provided information.'\n"
+                "You are a helpful genealogical and historical research assistant. Answer questions about the families, people, and events in Dragedal using ONLY the information provided in the CONTEXT below. "
+                "When discussing people, include details about their family relationships, dates, locations, and significant events when available. "
+                "If asked about families, provide information about family members, their connections, and their history in Dragedal. "
+                "If the answer is not in the context, reply with 'I don't have that information in the provided documents about Dragedal.'\n\n"
                 f"CONTEXT:\n{context}"
             )
         },
