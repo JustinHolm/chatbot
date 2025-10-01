@@ -68,9 +68,9 @@ def load_vectorstore(api_key):
         st.warning("No text files found in docs/ folder.")
         return None
 
-    # Read and chunk documents with smaller chunks for Streamlit Cloud
-    chunk_size = 500  # Much smaller for Streamlit Cloud
-    chunk_overlap = 100
+    # Read and chunk documents with optimized chunking for speed
+    chunk_size = 800  # Balanced size for speed and token limits
+    chunk_overlap = 150
     all_docs, all_metas, all_ids = [], [], []
     idx = 0
     
@@ -89,42 +89,61 @@ def load_vectorstore(api_key):
                         all_ids.append(f"{filename}_{idx}")
                         idx += 1
         
-        # Add documents to ChromaDB with very conservative batching for Streamlit Cloud
+        # Add documents to ChromaDB with intelligent batching for speed
         if all_docs:
             total_chunks = len(all_docs)
             progress_bar = st.progress(0)
             processed = 0
             
-            # Process documents one by one for maximum reliability on Streamlit Cloud
-            for i, (doc, meta, doc_id) in enumerate(zip(all_docs, all_metas, all_ids)):
-                # Check token count for this single document
-                doc_tokens = len(encoding.encode(doc))
+            # Process in smart batches based on token count
+            i = 0
+            while i < total_chunks:
+                batch_docs = []
+                batch_metas = []
+                batch_ids = []
+                batch_tokens = 0
+                max_batch_tokens = 150000  # Conservative but faster than one-by-one
                 
-                # Skip documents that are too large
-                if doc_tokens > 8000:  # Very conservative limit
-                    st.warning(f"Skipping large document chunk ({doc_tokens} tokens)")
-                    processed += 1
-                    progress_bar.progress(processed / total_chunks)
-                    continue
+                # Build batch until we hit token limit
+                while i < total_chunks and len(batch_docs) < 25:  # Max 25 docs per batch
+                    doc = all_docs[i]
+                    doc_tokens = len(encoding.encode(doc))
+                    
+                    # If this doc would exceed limit, process current batch
+                    if batch_tokens + doc_tokens > max_batch_tokens and len(batch_docs) > 0:
+                        break
+                    
+                    # Skip extremely large documents
+                    if doc_tokens > 10000:
+                        st.warning(f"Skipping very large document chunk ({doc_tokens} tokens)")
+                        i += 1
+                        continue
+                    
+                    batch_docs.append(doc)
+                    batch_metas.append(all_metas[i])
+                    batch_ids.append(all_ids[i])
+                    batch_tokens += doc_tokens
+                    i += 1
                 
-                try:
-                    collection.add(documents=[doc], metadatas=[meta], ids=[doc_id])
-                    processed += 1
-                    
-                    # Update progress every 10 documents
-                    if processed % 10 == 0:
-                        progress_bar.progress(processed / total_chunks)
-                    
-                    # Add small delay to avoid overwhelming Streamlit Cloud
-                    if processed % 20 == 0:
-                        time.sleep(0.1)
+                # Process the batch
+                if batch_docs:
+                    try:
+                        collection.add(documents=batch_docs, metadatas=batch_metas, ids=batch_ids)
+                        processed += len(batch_docs)
+                        progress_bar.progress(min(processed / total_chunks, 1.0))
                         
-                except Exception as e:
-                    st.warning(f"Skipped document chunk due to error: {str(e)[:100]}...")
-                    processed += 1
-                    continue
+                    except Exception as e:
+                        # If batch fails, try smaller batches
+                        st.warning(f"Large batch failed, trying smaller batches...")
+                        for doc, meta, doc_id in zip(batch_docs, batch_metas, batch_ids):
+                            try:
+                                collection.add(documents=[doc], metadatas=[meta], ids=[doc_id])
+                                processed += 1
+                            except Exception as e2:
+                                st.warning(f"Skipped problematic document: {str(e2)[:50]}...")
+                                processed += 1
+                        progress_bar.progress(min(processed / total_chunks, 1.0))
             
-            progress_bar.progress(1.0)
             progress_bar.empty()
             st.success(f"✅ Successfully loaded {processed} text segments from {len(filepaths)} historical documents.")
     
