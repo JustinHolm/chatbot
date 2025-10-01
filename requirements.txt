@@ -1,4 +1,6 @@
-chromadb
-openai
 streamlit
+openai
+chromadb
+tiktoken
 tqdm
+pysqlite3-binary
